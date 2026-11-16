@@ -44,6 +44,7 @@
           <div>Memory: ${h.mem_percent}%</div><div class="bar"><div class="fill" style="width:${h.mem_percent}%"></div></div>
           <div>Disk: ${h.disk_percent}%</div><div class="bar"><div class="fill" style="width:${h.disk_percent}%"></div></div>
           <div>Net RX/TX: ${h.net_rx_bytes} / ${h.net_tx_bytes} B</div>
+          <div>Services: ${(h.services||[]).map(s => `${s.name}:${s.active?'UP':'DOWN'}`).join(', ') || 'none'}</div>
           <svg viewBox="0 0 280 80">${sparkline(hist.samples, 'cpu_percent', '#3b82f6')}${sparkline(hist.samples, 'mem_percent', '#22c55e')}</svg>
         `;
         box.appendChild(card);

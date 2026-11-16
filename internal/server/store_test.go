@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"net/http"
 	"net/http/httptest"
+	"path/filepath"
 	"testing"
 
 	"github.com/fully-ai/hostwatch/internal/metrics"
@@ -61,5 +62,20 @@ func TestStoreAuthMultiHostHistoryAndAlerts(t *testing.T) {
 	}
 	if len(store.HostHistory("web-01")) != 1 {
 		t.Fatalf("expected 1 sample in history")
+	}
+
+	// Verify state persistence across store reload
+	snapFile := filepath.Join(t.TempDir(), "state.json")
+	if err := store.EnablePersistence(snapFile); err != nil {
+		t.Fatal(err)
+	}
+	store.Ingest(s2)
+
+	reloaded := NewStore("secret-token", Thresholds{}, 10)
+	if err := reloaded.EnablePersistence(snapFile); err != nil {
+		t.Fatal(err)
+	}
+	if len(reloaded.LatestHosts()) != 2 {
+		t.Fatalf("expected 2 hosts restored from snapshot, got %d", len(reloaded.LatestHosts()))
 	}
 }

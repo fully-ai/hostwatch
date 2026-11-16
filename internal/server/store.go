@@ -6,6 +6,8 @@ import (
 	"encoding/json"
 	"fmt"
 	"net/http"
+	"os"
+	"path/filepath"
 	"sort"
 	"strings"
 	"sync"
@@ -36,6 +38,7 @@ type Store struct {
 	mu          sync.RWMutex
 	maxSamples  int
 	agentToken  string
+	statePath   string
 	thresholds  Thresholds
 	history     map[string][]metrics.HostSample
 	alerts      []Alert
@@ -50,6 +53,50 @@ func NewStore(agentToken string, thresholds Thresholds, maxSamples int) *Store {
 		agentToken: agentToken,
 		thresholds: thresholds,
 		history:    make(map[string][]metrics.HostSample),
+	}
+}
+
+func (s *Store) EnablePersistence(path string) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.statePath = path
+	if path == "" {
+		return nil
+	}
+	raw, err := os.ReadFile(path)
+	if err != nil {
+		if os.IsNotExist(err) {
+			return nil
+		}
+		return err
+	}
+	var snap struct {
+		History map[string][]metrics.HostSample `json:"history"`
+		Alerts  []Alert                         `json:"alerts"`
+	}
+	if err := json.Unmarshal(raw, &snap); err != nil {
+		return err
+	}
+	if snap.History != nil {
+		s.history = snap.History
+	}
+	if snap.Alerts != nil {
+		s.alerts = snap.Alerts
+	}
+	return nil
+}
+
+func (s *Store) saveLocked() {
+	if s.statePath == "" {
+		return
+	}
+	_ = os.MkdirAll(filepath.Dir(s.statePath), 0o755)
+	snap := struct {
+		History map[string][]metrics.HostSample `json:"history"`
+		Alerts  []Alert                         `json:"alerts"`
+	}{History: s.history, Alerts: s.alerts}
+	if data, err := json.Marshal(snap); err == nil {
+		_ = os.WriteFile(s.statePath, data, 0o600)
 	}
 }
 
@@ -108,6 +155,7 @@ func (s *Store) Ingest(sample metrics.HostSample) {
 			})
 		}
 	}
+	s.saveLocked()
 }
 
 func (s *Store) LatestHosts() []metrics.HostSample {
