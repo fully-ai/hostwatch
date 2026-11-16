@@ -1,3 +1,3 @@
 module github.com/fully-ai/hostwatch
 
-go 1.27.4
+go 1.24
