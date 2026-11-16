@@ -1,0 +1,14 @@
+services:
+  server:
+    build: .
+    command: ["hostwatch-server", "-addr", "0.0.0.0:8096", "-token", "${HOSTWATCH_TOKEN:-dev-token}"]
+    ports:
+      - "8096:8096"
+    restart: unless-stopped
+
+  agent:
+    build: .
+    command: ["hostwatch-agent", "-server", "http://server:8096", "-token", "${HOSTWATCH_TOKEN:-dev-token}", "-interval", "5s"]
+    depends_on:
+      - server
+    restart: unless-stopped
