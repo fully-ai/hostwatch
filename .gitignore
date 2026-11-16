@@ -1,0 +1,5 @@
+bin/
+/hostwatch-agent
+/hostwatch-server
+*.exe
+.env
