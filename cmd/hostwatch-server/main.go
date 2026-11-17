@@ -13,6 +13,7 @@ func main() {
 	addr := flag.String("addr", "127.0.0.1:8096", "Server listen address")
 	token := flag.String("token", os.Getenv("HOSTWATCH_TOKEN"), "Optional bearer token required from agents")
 	statePath := flag.String("state", "", "Optional JSON snapshot path for host history persistence")
+	webhookURL := flag.String("webhook", os.Getenv("HOSTWATCH_WEBHOOK_URL"), "Optional webhook URL for new alerts")
 	maxCPU := flag.Float64("max-cpu", 90.0, "CPU alert threshold percent")
 	maxMem := flag.Float64("max-mem", 90.0, "Memory alert threshold percent")
 	maxDisk := flag.Float64("max-disk", 90.0, "Disk alert threshold percent")
@@ -23,6 +24,9 @@ func main() {
 		MaxMemPercent:  *maxMem,
 		MaxDiskPercent: *maxDisk,
 	}, 180)
+	if *webhookURL != "" {
+		store.SetWebhookURL(*webhookURL)
+	}
 	if *statePath != "" {
 		if err := store.EnablePersistence(*statePath); err != nil {
 			fmt.Fprintf(os.Stderr, "state load error: %v\n", err)

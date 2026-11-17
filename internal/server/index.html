@@ -7,19 +7,40 @@
   <style>
     body { margin: 0; font-family: system-ui, sans-serif; background: #0d1117; color: #e6edf3; padding: 24px; }
     .hosts { display: grid; grid-template-columns: repeat(auto-fit, minmax(300px, 1fr)); gap: 14px; margin-bottom: 24px; }
-    .card { background: #161b22; border: 1px solid #30363d; border-radius: 8px; padding: 16px; }
+    .card { background: #161b22; border: 1px solid #30363d; border-radius: 8px; padding: 16px; margin-bottom: 14px; }
     .bar { height: 8px; background: #21262d; border-radius: 4px; overflow: hidden; margin: 6px 0 10px; }
     .fill { height: 100%; background: #2f81f7; }
     svg { width: 100%; height: 90px; background: #0d1117; border-radius: 6px; margin-top: 8px; }
-    .alert { background: #3b1219; border: 1px solid #f85149; padding: 8px 12px; border-radius: 6px; margin-bottom: 8px; font-size: 0.9rem; }
+    .alert { background: #3b1219; border: 1px solid #f85149; padding: 8px 12px; border-radius: 6px; margin-bottom: 8px; font-size: 0.9rem; display: flex; justify-content: space-between; align-items: center; }
+    .alert.ack { background: #161b22; border-color: #30363d; color: #8b949e; }
+    .pill { display: inline-block; padding: 2px 8px; border-radius: 999px; font-size: 0.72rem; font-weight: 700; margin-left: 6px; }
+    .st-online { background: #14532d; color: #bbf7d0; }
+    .st-degraded { background: #713f12; color: #fef08a; }
+    .st-offline { background: #7f1d1d; color: #fecaca; }
+    input, button { padding: 6px 10px; border-radius: 6px; border: 1px solid #30363d; background: #21262d; color: #e6edf3; }
+    button { background: #2f81f7; border: none; cursor: pointer; font-weight: 600; }
   </style>
 </head>
 <body>
-  <h1>HostWatch</h1>
+  <div style="display:flex;justify-content:space-between;align-items:center;">
+    <h1>HostWatch</h1>
+    <a href="/metrics" style="color:#58a6ff;font-size:0.9rem;">Prometheus /metrics</a>
+  </div>
+  <div class="card" style="display:flex;gap:10px;flex-wrap:wrap;align-items:center;">
+    <strong>Alert Thresholds (%):</strong>
+    <label>CPU <input id="t-cpu" type="number" min="0" max="100" style="width:70px;" /></label>
+    <label>Mem <input id="t-mem" type="number" min="0" max="100" style="width:70px;" /></label>
+    <label>Disk <input id="t-disk" type="number" min="0" max="100" style="width:70px;" /></label>
+    <input id="t-token" type="password" placeholder="Optional Bearer Token" style="width:180px;" />
+    <button onclick="saveThresholds()">Save Thresholds</button>
+  </div>
   <div id="hosts" class="hosts"></div>
-  <h2>Recent Alerts</h2>
+  <h2>Alerts</h2>
   <div id="alerts"></div>
   <script>
+    function esc(s) {
+      return String(s ?? '').replace(/[&<>"']/g, c => ({ '&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;' }[c]));
+    }
     function sparkline(samples, key, color) {
       if (!samples.length) return '';
       const w = 280, h = 80;
@@ -30,6 +51,30 @@
       }).join(' ');
       return `<polyline fill="none" stroke="${color}" stroke-width="2" points="${pts}" />`;
     }
+    async function loadThresholds() {
+      const t = await fetch('/api/thresholds').then(r => r.json());
+      document.getElementById('t-cpu').value = t.max_cpu_percent;
+      document.getElementById('t-mem').value = t.max_mem_percent;
+      document.getElementById('t-disk').value = t.max_disk_percent;
+    }
+    function authHeaders() {
+      const tok = document.getElementById('t-token').value.trim();
+      return tok ? { Authorization: 'Bearer ' + tok, 'Content-Type': 'application/json' } : { 'Content-Type': 'application/json' };
+    }
+    async function saveThresholds() {
+      await fetch('/api/thresholds', {
+        method: 'PUT', headers: authHeaders(),
+        body: JSON.stringify({
+          max_cpu_percent: Number(document.getElementById('t-cpu').value),
+          max_mem_percent: Number(document.getElementById('t-mem').value),
+          max_disk_percent: Number(document.getElementById('t-disk').value)
+        })
+      });
+    }
+    async function ackAlert(id) {
+      await fetch(`/api/alerts/${encodeURIComponent(id)}/ack`, { method: 'POST', headers: authHeaders() });
+      await refresh();
+    }
     async function refresh() {
       const { hosts } = await fetch('/api/hosts').then(r => r.json());
       const box = document.getElementById('hosts');
@@ -38,21 +83,27 @@
         const hist = await fetch(`/api/hosts/${encodeURIComponent(h.host_id)}/history`).then(r => r.json());
         const card = document.createElement('div');
         card.className = 'card';
+        const st = h.status || 'online';
         card.innerHTML = `
-          <strong>${h.hostname}</strong> <small>(${h.os}/${h.arch}, ${h.num_cpu} CPUs)</small>
-          <div>CPU: ${h.cpu_percent}%</div><div class="bar"><div class="fill" style="width:${h.cpu_percent}%"></div></div>
-          <div>Memory: ${h.mem_percent}%</div><div class="bar"><div class="fill" style="width:${h.mem_percent}%"></div></div>
-          <div>Disk: ${h.disk_percent}%</div><div class="bar"><div class="fill" style="width:${h.disk_percent}%"></div></div>
-          <div>Net RX/TX: ${h.net_rx_bytes} / ${h.net_tx_bytes} B</div>
-          <div>Services: ${(h.services||[]).map(s => `${s.name}:${s.active?'UP':'DOWN'}`).join(', ') || 'none'}</div>
+          <strong>${esc(h.hostname)}</strong> <span class="pill st-${esc(st)}">${esc(st)}</span> <small>(${esc(h.os)}/${esc(h.arch)}, ${esc(h.num_cpu)} CPUs)</small>
+          <div>CPU: ${esc(h.cpu_percent)}%</div><div class="bar"><div class="fill" style="width:${Math.min(100, h.cpu_percent)}%"></div></div>
+          <div>Memory: ${esc(h.mem_percent)}%</div><div class="bar"><div class="fill" style="width:${Math.min(100, h.mem_percent)}%"></div></div>
+          <div>Disk: ${esc(h.disk_percent)}%</div><div class="bar"><div class="fill" style="width:${Math.min(100, h.disk_percent)}%"></div></div>
+          <div>Net RX/TX: ${esc(h.net_rx_bytes)} / ${esc(h.net_tx_bytes)} B</div>
+          <div>Services: ${(h.services||[]).map(s => `${esc(s.name)}:${s.active?'UP':'DOWN'}`).join(', ') || 'none'}</div>
           <svg viewBox="0 0 280 80">${sparkline(hist.samples, 'cpu_percent', '#3b82f6')}${sparkline(hist.samples, 'mem_percent', '#22c55e')}</svg>
         `;
         box.appendChild(card);
       }
       const { alerts } = await fetch('/api/alerts').then(r => r.json());
       const ab = document.getElementById('alerts');
-      ab.innerHTML = alerts.slice(-10).reverse().map(a => `<div class="alert">${a.triggered_at}: ${a.message}</div>`).join('') || '<div>No alerts</div>';
+      ab.innerHTML = alerts.slice(-15).reverse().map(a => `
+        <div class="alert ${a.acknowledged?'ack':''}">
+          <span>${esc(a.triggered_at)}: ${esc(a.message)}</span>
+          ${a.acknowledged ? '<small>Acknowledged</small>' : `<button onclick="ackAlert('${esc(a.id)}')">Acknowledge</button>`}
+        </div>`).join('') || '<div>No alerts</div>';
     }
+    loadThresholds();
     refresh();
     setInterval(refresh, 5000);
   </script>

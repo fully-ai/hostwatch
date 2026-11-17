@@ -68,11 +68,23 @@ GOOS=windows GOARCH=amd64 go build -o hostwatch-agent.exe ./cmd/hostwatch-agent
 | Method & Path | Auth | Description |
 | --- | --- | --- |
 | `GET /` | Public | Embedded SVG sparkline dashboard |
+| `GET /metrics` | Public | Prometheus `0.0.4` telemetry and alert metrics |
 | `GET /api/health` | Public | Collector health status |
 | `POST /api/ingest` | Bearer | Push `HostSample` telemetry payload |
-| `GET /api/hosts` | Public | Latest sample for all registered hosts |
+| `GET /api/hosts` | Public | Latest sample and liveness status (`online`/`degraded`/`offline`) for all hosts |
 | `GET /api/hosts/{id}/history` | Public | Time-series samples for a host |
 | `GET /api/alerts` | Public | Threshold and inactive-service alert events |
+| `POST /api/alerts/{id}/ack` | Bearer | Acknowledge an alert by ID |
+| `GET` / `PUT /api/thresholds` | Public / Bearer | Read or update runtime CPU/Mem/Disk alert thresholds |
+
+## Quick Start
+
+1. **Requirements**: Go 1.24+
+2. **Clone**: `git clone https://github.com/fully-ai/hostwatch.git && cd hostwatch`
+3. **Build**: `./scripts/install.sh` (Windows: `.\scripts\install.ps1`)
+4. **Start Collector**: `./scripts/dev.sh` (Windows: `.\scripts\dev.ps1`)
+5. **Open Dashboard**: `http://127.0.0.1:8096` (Prometheus metrics at `/metrics`)
+6. **Run Tests**: `./scripts/test.sh` (Windows: `.\scripts\test.ps1`)
 
 ## Architecture
 

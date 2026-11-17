@@ -1,8 +1,11 @@
 package server
 
 import (
+	"bytes"
+	"crypto/rand"
 	"crypto/subtle"
 	_ "embed"
+	"encoding/hex"
 	"encoding/json"
 	"fmt"
 	"net/http"
@@ -26,22 +29,33 @@ type Thresholds struct {
 }
 
 type Alert struct {
-	HostID      string    `json:"host_id"`
-	Metric      string    `json:"metric"`
-	Value       float64   `json:"value"`
-	Threshold   float64   `json:"threshold"`
-	Message     string    `json:"message"`
-	TriggeredAt time.Time `json:"triggered_at"`
+	ID           string     `json:"id"`
+	HostID       string     `json:"host_id"`
+	Metric       string     `json:"metric"`
+	Value        float64    `json:"value"`
+	Threshold    float64    `json:"threshold"`
+	Message      string     `json:"message"`
+	TriggeredAt  time.Time  `json:"triggered_at"`
+	Acknowledged bool       `json:"acknowledged"`
+	AckAt        *time.Time `json:"ack_at,omitempty"`
+}
+
+type HostStatus struct {
+	metrics.HostSample
+	Status string `json:"status"`
 }
 
 type Store struct {
-	mu          sync.RWMutex
-	maxSamples  int
-	agentToken  string
-	statePath   string
-	thresholds  Thresholds
-	history     map[string][]metrics.HostSample
-	alerts      []Alert
+	mu           sync.RWMutex
+	maxSamples   int
+	agentToken   string
+	statePath    string
+	webhookURL   string
+	thresholds   Thresholds
+	history      map[string][]metrics.HostSample
+	alerts       []Alert
+	lastNotified map[string]time.Time
+	httpClient   *http.Client
 }
 
 func NewStore(agentToken string, thresholds Thresholds, maxSamples int) *Store {
@@ -49,11 +63,25 @@ func NewStore(agentToken string, thresholds Thresholds, maxSamples int) *Store {
 		maxSamples = 120
 	}
 	return &Store{
-		maxSamples: maxSamples,
-		agentToken: agentToken,
-		thresholds: thresholds,
-		history:    make(map[string][]metrics.HostSample),
+		maxSamples:   maxSamples,
+		agentToken:   agentToken,
+		thresholds:   thresholds,
+		history:      make(map[string][]metrics.HostSample),
+		lastNotified: make(map[string]time.Time),
+		httpClient:   &http.Client{Timeout: 5 * time.Second},
 	}
+}
+
+func (s *Store) SetWebhookURL(u string) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.webhookURL = strings.TrimSpace(u)
+}
+
+func newAlertID() string {
+	var b [8]byte
+	_, _ = rand.Read(b[:])
+	return hex.EncodeToString(b[:])
 }
 
 func (s *Store) EnablePersistence(path string) error {
@@ -113,62 +141,165 @@ func (s *Store) Ingest(sample metrics.HostSample) {
 	}
 	s.history[sample.HostID] = buf
 
-	if s.thresholds.MaxCPUPercent > 0 && sample.CPUPercent > s.thresholds.MaxCPUPercent {
-		s.alerts = append(s.alerts, Alert{
+	var triggered []Alert
+	addAlert := func(metric string, val, thr float64, msg string) {
+		a := Alert{
+			ID:          newAlertID(),
 			HostID:      sample.HostID,
-			Metric:      "cpu_percent",
-			Value:       sample.CPUPercent,
-			Threshold:   s.thresholds.MaxCPUPercent,
-			Message:     fmt.Sprintf("%s CPU at %.1f%% (threshold %.1f%%)", sample.HostID, sample.CPUPercent, s.thresholds.MaxCPUPercent),
+			Metric:      metric,
+			Value:       val,
+			Threshold:   thr,
+			Message:     msg,
 			TriggeredAt: sample.Timestamp,
-		})
+		}
+		s.alerts = append(s.alerts, a)
+		key := sample.HostID + "|" + metric
+		if s.webhookURL != "" && time.Since(s.lastNotified[key]) >= 60*time.Second {
+			s.lastNotified[key] = time.Now().UTC()
+			triggered = append(triggered, a)
+		}
+	}
+
+	if s.thresholds.MaxCPUPercent > 0 && sample.CPUPercent > s.thresholds.MaxCPUPercent {
+		addAlert("cpu_percent", sample.CPUPercent, s.thresholds.MaxCPUPercent,
+			fmt.Sprintf("%s CPU at %.1f%% (threshold %.1f%%)", sample.HostID, sample.CPUPercent, s.thresholds.MaxCPUPercent))
 	}
 	if s.thresholds.MaxMemPercent > 0 && sample.MemPercent > s.thresholds.MaxMemPercent {
-		s.alerts = append(s.alerts, Alert{
-			HostID:      sample.HostID,
-			Metric:      "mem_percent",
-			Value:       sample.MemPercent,
-			Threshold:   s.thresholds.MaxMemPercent,
-			Message:     fmt.Sprintf("%s Memory at %.1f%% (threshold %.1f%%)", sample.HostID, sample.MemPercent, s.thresholds.MaxMemPercent),
-			TriggeredAt: sample.Timestamp,
-		})
+		addAlert("mem_percent", sample.MemPercent, s.thresholds.MaxMemPercent,
+			fmt.Sprintf("%s Memory at %.1f%% (threshold %.1f%%)", sample.HostID, sample.MemPercent, s.thresholds.MaxMemPercent))
 	}
 	if s.thresholds.MaxDiskPercent > 0 && sample.DiskPercent > s.thresholds.MaxDiskPercent {
-		s.alerts = append(s.alerts, Alert{
-			HostID:      sample.HostID,
-			Metric:      "disk_percent",
-			Value:       sample.DiskPercent,
-			Threshold:   s.thresholds.MaxDiskPercent,
-			Message:     fmt.Sprintf("%s Disk at %.1f%% (threshold %.1f%%)", sample.HostID, sample.DiskPercent, s.thresholds.MaxDiskPercent),
-			TriggeredAt: sample.Timestamp,
-		})
+		addAlert("disk_percent", sample.DiskPercent, s.thresholds.MaxDiskPercent,
+			fmt.Sprintf("%s Disk at %.1f%% (threshold %.1f%%)", sample.HostID, sample.DiskPercent, s.thresholds.MaxDiskPercent))
 	}
 	for _, svc := range sample.Services {
 		if !svc.Active {
-			s.alerts = append(s.alerts, Alert{
-				HostID:      sample.HostID,
-				Metric:      "service:" + svc.Name,
-				Value:       0,
-				Threshold:   1,
-				Message:     fmt.Sprintf("%s service %q is inactive", sample.HostID, svc.Name),
-				TriggeredAt: sample.Timestamp,
-			})
+			addAlert("service:"+svc.Name, 0, 1, fmt.Sprintf("%s service %q is inactive", sample.HostID, svc.Name))
 		}
 	}
+	webhook := s.webhookURL
 	s.saveLocked()
+	if webhook != "" && len(triggered) > 0 {
+		for _, a := range triggered {
+			go s.dispatchWebhook(webhook, a)
+		}
+	}
 }
 
-func (s *Store) LatestHosts() []metrics.HostSample {
+func (s *Store) dispatchWebhook(url string, alert Alert) {
+	body, err := json.Marshal(alert)
+	if err != nil {
+		return
+	}
+	req, err := http.NewRequest(http.MethodPost, url, bytes.NewReader(body))
+	if err != nil {
+		return
+	}
+	req.Header.Set("Content-Type", "application/json")
+	resp, err := s.httpClient.Do(req)
+	if err == nil {
+		_ = resp.Body.Close()
+	}
+}
+
+func computeStatus(ts time.Time) string {
+	age := time.Since(ts)
+	if age <= 30*time.Second {
+		return "online"
+	}
+	if age <= 120*time.Second {
+		return "degraded"
+	}
+	return "offline"
+}
+
+func (s *Store) LatestHosts() []HostStatus {
 	s.mu.RLock()
 	defer s.mu.RUnlock()
-	out := make([]metrics.HostSample, 0, len(s.history))
+	out := make([]HostStatus, 0, len(s.history))
 	for _, samples := range s.history {
 		if len(samples) > 0 {
-			out = append(out, samples[len(samples)-1])
+			last := samples[len(samples)-1]
+			out = append(out, HostStatus{
+				HostSample: last,
+				Status:     computeStatus(last.Timestamp),
+			})
 		}
 	}
 	sort.Slice(out, func(i, j int) bool { return out[i].HostID < out[j].HostID })
 	return out
+}
+
+func (s *Store) AcknowledgeAlert(id string) bool {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	for i := range s.alerts {
+		if s.alerts[i].ID == id {
+			now := time.Now().UTC()
+			s.alerts[i].Acknowledged = true
+			s.alerts[i].AckAt = &now
+			s.saveLocked()
+			return true
+		}
+	}
+	return false
+}
+
+func (s *Store) Thresholds() Thresholds {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	return s.thresholds
+}
+
+func (s *Store) SetThresholds(t Thresholds) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.thresholds = t
+}
+
+func (s *Store) PrometheusMetrics() string {
+	hosts := s.LatestHosts()
+	alerts := s.Alerts()
+	activeAlerts := 0
+	for _, a := range alerts {
+		if !a.Acknowledged {
+			activeAlerts++
+		}
+	}
+	var sb strings.Builder
+	sb.WriteString("# TYPE hostwatch_cpu_percent gauge\n")
+	for _, h := range hosts {
+		fmt.Fprintf(&sb, "hostwatch_cpu_percent{host_id=%q,os=%q} %.2f\n", h.HostID, h.OS, h.CPUPercent)
+	}
+	sb.WriteString("# TYPE hostwatch_mem_percent gauge\n")
+	for _, h := range hosts {
+		fmt.Fprintf(&sb, "hostwatch_mem_percent{host_id=%q,os=%q} %.2f\n", h.HostID, h.OS, h.MemPercent)
+	}
+	sb.WriteString("# TYPE hostwatch_disk_percent gauge\n")
+	for _, h := range hosts {
+		fmt.Fprintf(&sb, "hostwatch_disk_percent{host_id=%q,os=%q} %.2f\n", h.HostID, h.OS, h.DiskPercent)
+	}
+	sb.WriteString("# TYPE hostwatch_net_rx_bytes counter\n")
+	for _, h := range hosts {
+		fmt.Fprintf(&sb, "hostwatch_net_rx_bytes{host_id=%q} %d\n", h.HostID, h.NetRxBytes)
+	}
+	sb.WriteString("# TYPE hostwatch_net_tx_bytes counter\n")
+	for _, h := range hosts {
+		fmt.Fprintf(&sb, "hostwatch_net_tx_bytes{host_id=%q} %d\n", h.HostID, h.NetTxBytes)
+	}
+	sb.WriteString("# TYPE hostwatch_service_up gauge\n")
+	for _, h := range hosts {
+		for _, svc := range h.Services {
+			v := 0
+			if svc.Active {
+				v = 1
+			}
+			fmt.Fprintf(&sb, "hostwatch_service_up{host_id=%q,service=%q} %d\n", h.HostID, svc.Name, v)
+		}
+	}
+	sb.WriteString("# TYPE hostwatch_alerts_active gauge\n")
+	fmt.Fprintf(&sb, "hostwatch_alerts_active %d\n", activeAlerts)
+	return sb.String()
 }
 
 func (s *Store) HostHistory(hostID string) []metrics.HostSample {
@@ -234,8 +365,61 @@ func (s *Store) Handler() http.Handler {
 		}
 		writeJSON(w, http.StatusOK, map[string]any{"host_id": hostID, "samples": s.HostHistory(hostID)})
 	})
+	mux.HandleFunc("/metrics", func(w http.ResponseWriter, _ *http.Request) {
+		w.Header().Set("Content-Type", "text/plain; version=0.0.4; charset=utf-8")
+		_, _ = w.Write([]byte(s.PrometheusMetrics()))
+	})
+	mux.HandleFunc("/api/thresholds", func(w http.ResponseWriter, r *http.Request) {
+		if r.Method == http.MethodGet {
+			writeJSON(w, http.StatusOK, s.Thresholds())
+			return
+		}
+		if r.Method != http.MethodPut {
+			http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+			return
+		}
+		if s.agentToken != "" {
+			auth := r.Header.Get("Authorization")
+			token := strings.TrimPrefix(auth, "Bearer ")
+			if !strings.HasPrefix(auth, "Bearer ") || subtle.ConstantTimeCompare([]byte(token), []byte(s.agentToken)) != 1 {
+				http.Error(w, "unauthorized", http.StatusUnauthorized)
+				return
+			}
+		}
+		var thr Thresholds
+		if err := json.NewDecoder(http.MaxBytesReader(w, r.Body, 8<<10)).Decode(&thr); err != nil {
+			http.Error(w, "invalid thresholds", http.StatusBadRequest)
+			return
+		}
+		if thr.MaxCPUPercent < 0 || thr.MaxCPUPercent > 100 || thr.MaxMemPercent < 0 || thr.MaxMemPercent > 100 || thr.MaxDiskPercent < 0 || thr.MaxDiskPercent > 100 {
+			http.Error(w, "thresholds must be 0..100", http.StatusBadRequest)
+			return
+		}
+		s.SetThresholds(thr)
+		writeJSON(w, http.StatusOK, thr)
+	})
 	mux.HandleFunc("/api/alerts", func(w http.ResponseWriter, _ *http.Request) {
 		writeJSON(w, http.StatusOK, map[string]any{"alerts": s.Alerts()})
+	})
+	mux.HandleFunc("/api/alerts/", func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != http.MethodPost || !strings.HasSuffix(r.URL.Path, "/ack") {
+			http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+			return
+		}
+		if s.agentToken != "" {
+			auth := r.Header.Get("Authorization")
+			token := strings.TrimPrefix(auth, "Bearer ")
+			if !strings.HasPrefix(auth, "Bearer ") || subtle.ConstantTimeCompare([]byte(token), []byte(s.agentToken)) != 1 {
+				http.Error(w, "unauthorized", http.StatusUnauthorized)
+				return
+			}
+		}
+		id := strings.TrimSuffix(strings.TrimPrefix(r.URL.Path, "/api/alerts/"), "/ack")
+		if id == "" || !s.AcknowledgeAlert(id) {
+			http.Error(w, "alert not found", http.StatusNotFound)
+			return
+		}
+		writeJSON(w, http.StatusOK, map[string]string{"status": "acknowledged", "id": id})
 	})
 	return mux
 }

@@ -6,7 +6,10 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"path/filepath"
+	"strings"
+	"sync/atomic"
 	"testing"
+	"time"
 
 	"github.com/fully-ai/hostwatch/internal/metrics"
 )
@@ -77,5 +80,82 @@ func TestStoreAuthMultiHostHistoryAndAlerts(t *testing.T) {
 	}
 	if len(reloaded.LatestHosts()) != 2 {
 		t.Fatalf("expected 2 hosts restored from snapshot, got %d", len(reloaded.LatestHosts()))
+	}
+}
+
+
+func TestPrometheusMetricsThresholdsAckAndWebhook(t *testing.T) {
+	var webhookHits atomic.Int32
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		webhookHits.Add(1)
+		w.WriteHeader(http.StatusOK)
+	}))
+	defer srv.Close()
+
+	store := NewStore("tok", Thresholds{MaxCPUPercent: 80, MaxMemPercent: 85, MaxDiskPercent: 90}, 20)
+	store.SetWebhookURL(srv.URL)
+	h := store.Handler()
+
+	// Update thresholds via API
+	thrBody, _ := json.Marshal(Thresholds{MaxCPUPercent: 70, MaxMemPercent: 80, MaxDiskPercent: 90})
+	putReq := httptest.NewRequest(http.MethodPut, "/api/thresholds", bytes.NewReader(thrBody))
+	putReq.Header.Set("Authorization", "Bearer tok")
+	putW := httptest.NewRecorder()
+	h.ServeHTTP(putW, putReq)
+	if putW.Code != http.StatusOK {
+		t.Fatalf("expected 200 on PUT /api/thresholds, got %d", putW.Code)
+	}
+
+	// Trigger CPU alert (75 > 70)
+	sample := metrics.HostSample{
+		HostID:      "db-01",
+		Hostname:    "db-01",
+		OS:          "linux",
+		Arch:        "amd64",
+		CPUPercent:  75.5,
+		MemPercent:  40.0,
+		DiskPercent: 55.0,
+		Services:    []metrics.ServiceState{{Name: "postgres", Active: true}},
+		Timestamp:   time.Now().UTC(),
+	}
+	store.Ingest(sample)
+
+	// Wait briefly for async webhook goroutine
+	deadline := time.Now().Add(2 * time.Second)
+	for webhookHits.Load() == 0 && time.Now().Before(deadline) {
+		time.Sleep(10 * time.Millisecond)
+	}
+	if webhookHits.Load() != 1 {
+		t.Fatalf("expected 1 webhook notification, got %d", webhookHits.Load())
+	}
+
+	// Verify Prometheus /metrics output
+	metW := httptest.NewRecorder()
+	h.ServeHTTP(metW, httptest.NewRequest(http.MethodGet, "/metrics", nil))
+	if metW.Code != http.StatusOK {
+		t.Fatalf("expected 200 from /metrics, got %d", metW.Code)
+	}
+	prom := metW.Body.String()
+	if !strings.Contains(prom, `hostwatch_cpu_percent{host_id="db-01",os="linux"} 75.50`) {
+		t.Fatalf("missing cpu metric in /metrics:\n%s", prom)
+	}
+	if !strings.Contains(prom, "hostwatch_alerts_active 1") {
+		t.Fatalf("expected 1 active alert in /metrics:\n%s", prom)
+	}
+
+	// Acknowledge alert
+	alerts := store.Alerts()
+	ackReq := httptest.NewRequest(http.MethodPost, "/api/alerts/"+alerts[0].ID+"/ack", nil)
+	ackReq.Header.Set("Authorization", "Bearer tok")
+	ackW := httptest.NewRecorder()
+	h.ServeHTTP(ackW, ackReq)
+	if ackW.Code != http.StatusOK {
+		t.Fatalf("expected 200 on alert ack, got %d", ackW.Code)
+	}
+
+	metW2 := httptest.NewRecorder()
+	h.ServeHTTP(metW2, httptest.NewRequest(http.MethodGet, "/metrics", nil))
+	if !strings.Contains(metW2.Body.String(), "hostwatch_alerts_active 0") {
+		t.Fatalf("expected 0 active alerts after ack:\n%s", metW2.Body.String())
 	}
 }
